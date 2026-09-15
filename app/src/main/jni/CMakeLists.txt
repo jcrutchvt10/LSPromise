@@ -7,6 +7,6 @@ set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -I${CMAKE_SOURCE_DIR}")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_FLAGS} -I${CMAKE_SOURCE_DIR}  -Wall -Wextra -Wmost -fno-stack-protector -fomit-frame-pointer")
 
-add_library(exp SHARED exp.c stage1.S elf_parser.c)
+add_library(exp SHARED exp.c stage1.S elf_parser.c pngtest.c)
 
-target_link_libraries(exp log)
+target_link_libraries(exp log dl)

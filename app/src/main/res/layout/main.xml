@@ -21,6 +21,11 @@
     <Button
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:text="PNG probe (in-app crash test)"
+        android:id="@+id/pngProbe"/>
+    <Button
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:text="patchMod"
         android:visibility="gone"
         android:id="@+id/patchMod"/>

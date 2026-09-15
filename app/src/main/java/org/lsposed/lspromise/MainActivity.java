@@ -11,6 +11,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
@@ -313,6 +315,61 @@ public class MainActivity extends Activity implements View.OnClickListener {
         }).start();
     }
 
+    /** Decode bundled paletted PoCs in-app. A native crash here (tombstone)
+     * proves the NEON palette OOB is reachable via BitmapFactory->libpng.
+     * No crash is inconclusive (small OOB may sit in slab slack). */
+    private void probePng() {
+        new Thread(() -> {
+            int[] ids = {R.raw.poc_rgb_17x256, R.raw.poc_rgba_17x256};
+            String[] names = {"rgb17", "rgba17"};
+            for (int k = 0; k < ids.length; k++) {
+                String result;
+                try {
+                    var is = getResources().openRawResource(ids[k]);
+                    Bitmap bmp = BitmapFactory.decodeStream(is);
+                    is.close();
+                    if (bmp == null) {
+                        result = names[k] + ": decode returned null";
+                    } else {
+                        int w = bmp.getWidth(), h = bmp.getHeight();
+                        int[] px = new int[w * h];
+                        bmp.getPixels(px, 0, w, 0, 0, w, h);
+                        long sum = 0;
+                        for (int p : px) sum += p & 0xffffffffL;
+                        bmp.recycle();
+                        result = names[k] + ": decoded " + w + "x" + h
+                                + " sum=" + Long.toHexString(sum)
+                                + " (no crash - inconclusive, see notes)";
+                    }
+                } catch (Throwable t) {
+                    result = names[k] + ": threw " + t;
+                }
+                Log.d(TAG, result);
+                var msg = result;
+                runOnUiThread(() -> tv.append(msg + "\n"));
+            }
+            // Native libpng-direct row test (no Skia): per-row mallocs + canaries.
+            int[] rawIds = {R.raw.poc_rgb_8x8_ctl, R.raw.poc_rgb_17x256,
+                    R.raw.poc_rgba_16x8_ctl, R.raw.poc_rgba_17x256};
+            String[] rawNames = {"ctl-rgb8", "test-rgb17", "ctl-rgba16", "test-rgba17"};
+            for (int k = 0; k < rawIds.length; k++) {
+                String res;
+                try {
+                    var in = getResources().openRawResource(rawIds[k]);
+                    byte[] data = in.readAllBytes();
+                    in.close();
+                    res = PngTest.runTest(data, rawNames[k]);
+                } catch (Throwable t) {
+                    res = rawNames[k] + ": harness threw " + t;
+                }
+                Log.d(TAG, res);
+                var m2 = res;
+                runOnUiThread(() -> tv.append(m2 + "\n"));
+            }
+            runOnUiThread(() -> tv.append("PNG probe done. Crash = vulnerable path confirmed.\n"));
+        }).start();
+    }
+
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
@@ -352,6 +409,11 @@ public class MainActivity extends Activity implements View.OnClickListener {
             var cm = getSystemService(ClipboardManager.class);
             cm.setPrimaryClip(ClipData.newPlainText("", tv.getText().toString()));
         });
+        var pngProbe = (Button) findViewById(R.id.pngProbe);
+        pngProbe.setOnClickListener(v -> {
+            tv.append("PNG probe: decoding paletted 17px PoCs...\n");
+            probePng();
+        });
         var shizukuCheck = (Button) findViewById(R.id.shizukuCheck);
         shizukuCheck.setOnClickListener(v -> {
             tv.append("--- manual check ---\n");
@@ -388,7 +450,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
         } catch (Throwable t) {
             Log.e(TAG, "shizuku listener failed", t);
         }
-        tv.append("LSPromise 1.2-deepdive\n");
+        tv.append("LSPromise 1.4-pngnative\n");
         tv.append("device=" + Build.DEVICE + " sdk=" + Build.VERSION.SDK_INT
                 + " patch=" + Build.VERSION.SECURITY_PATCH + "\n");
         if (isDeviceLikelyPatched()) {
