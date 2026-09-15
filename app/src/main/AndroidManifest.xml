@@ -5,8 +5,11 @@
         android:required="false" />
     <uses-permission android:name="android.permission.BROADCAST_STICKY" />
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
     <queries>
         <package android:name="me.weishu.kernelsu" />
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="rikka.shizuku" />
     </queries>
     <application
         android:appComponentFactory=".MyAppComponentFactory"
@@ -37,5 +40,15 @@
                 <action android:name="android.telecom.ConnectionService" />
             </intent-filter>
         </service>
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
     </application>
 </manifest>

